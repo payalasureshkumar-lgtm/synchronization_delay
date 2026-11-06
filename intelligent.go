@@ -2,27 +2,29 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
 
 const iterations = 1000
 
-type NodeArrival struct {
-	NodeID  int
-	Load    float64
-	Release chan struct{}
+type NodeState struct {
+	NodeID      int
+	ResourceLoad float64
+	ArrivalTime time.Time
+	Release      chan struct{}
 }
 
 type ResourceAwareBarrier struct {
 	total    int
-	arrivals chan NodeArrival
+	arrivals chan NodeState
 }
 
 func NewResourceAwareBarrier(total int) *ResourceAwareBarrier {
 	b := &ResourceAwareBarrier{
 		total:    total,
-		arrivals: make(chan NodeArrival, total),
+		arrivals: make(chan NodeState, total),
 	}
 
 	go b.coordinate()
@@ -32,19 +34,15 @@ func NewResourceAwareBarrier(total int) *ResourceAwareBarrier {
 
 func (b *ResourceAwareBarrier) coordinate() {
 	for {
-		batch := make([]NodeArrival, 0, b.total)
+		batch := make([]NodeState, 0, b.total)
 
 		for i := 0; i < b.total; i++ {
 			batch = append(batch, <-b.arrivals)
 		}
 
-		for i := 0; i < len(batch); i++ {
-			for j := i + 1; j < len(batch); j++ {
-				if batch[j].Load < batch[i].Load {
-					batch[i], batch[j] = batch[j], batch[i]
-				}
-			}
-		}
+		sort.Slice(batch, func(i, j int) bool {
+			return batch[i].ResourceLoad < batch[j].ResourceLoad
+		})
 
 		for _, node := range batch {
 			close(node.Release)
@@ -52,16 +50,50 @@ func (b *ResourceAwareBarrier) coordinate() {
 	}
 }
 
-func (b *ResourceAwareBarrier) Wait(nodeID int, load float64) {
+func (b *ResourceAwareBarrier) Wait(nodeID int, resourceLoad float64) {
 	release := make(chan struct{})
 
-	b.arrivals <- NodeArrival{
-		NodeID:  nodeID,
-		Load:    load,
-		Release: release,
+	b.arrivals <- NodeState{
+		NodeID:       nodeID,
+		ResourceLoad: resourceLoad,
+		ArrivalTime:  time.Now(),
+		Release:      release,
 	}
 
 	<-release
+}
+
+func runCluster(nodes int) float64 {
+	barrier := NewResourceAwareBarrier(nodes)
+
+	var wg sync.WaitGroup
+	var totalDelay time.Duration
+	var mu sync.Mutex
+
+	for i := 0; i < nodes; i++ {
+		wg.Add(1)
+
+		go func(nodeID int) {
+			defer wg.Done()
+
+			for j := 0; j < iterations; j++ {
+				resourceLoad := float64((nodeID*17+j*13)%100) / 100.0
+
+				start := time.Now()
+				barrier.Wait(nodeID, resourceLoad)
+				delay := time.Since(start)
+
+				mu.Lock()
+				totalDelay += delay
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	return float64(totalDelay.Nanoseconds()) /
+		float64(nodes*iterations) / 1e6
 }
 
 func main() {
@@ -70,37 +102,7 @@ func main() {
 	fmt.Println("Cluster Size,Intelligent Delay (ms)")
 
 	for _, nodes := range clusterSizes {
-		barrier := NewResourceAwareBarrier(nodes)
-
-		var wg sync.WaitGroup
-		var totalDelay time.Duration
-		var mu sync.Mutex
-
-		for i := 0; i < nodes; i++ {
-			wg.Add(1)
-
-			go func(nodeID int) {
-				defer wg.Done()
-
-				for j := 0; j < iterations; j++ {
-					load := float64((nodeID*17+j*13)%100) / 100.0
-
-					start := time.Now()
-					barrier.Wait(nodeID, load)
-					delay := time.Since(start)
-
-					mu.Lock()
-					totalDelay += delay
-					mu.Unlock()
-				}
-			}(i)
-		}
-
-		wg.Wait()
-
-		average := float64(totalDelay.Microseconds()) /
-			float64(nodes*iterations) / 1000
-
-		fmt.Printf("%d,%.6f\n", nodes, average)
+		delay := runCluster(nodes)
+		fmt.Printf("%d,%.6f\n", nodes, delay)
 	}
 }
