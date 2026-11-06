@@ -8,99 +8,77 @@ import (
 
 const iterations = 1000
 
-type NodeArrival struct {
-	NodeID  int
-	Load    float64
-	Release chan struct{}
+type Barrier struct {
+	mu         sync.Mutex
+	cond       *sync.Cond
+	total      int
+	arrived    int
+	generation int
 }
 
-type ResourceAwareBarrier struct {
-	total    int
-	arrivals chan NodeArrival
-}
-
-func NewResourceAwareBarrier(total int) *ResourceAwareBarrier {
-	b := &ResourceAwareBarrier{
-		total:    total,
-		arrivals: make(chan NodeArrival, total),
-	}
-
-	go b.coordinate()
-
+func NewBarrier(total int) *Barrier {
+	b := &Barrier{total: total}
+	b.cond = sync.NewCond(&b.mu)
 	return b
 }
 
-func (b *ResourceAwareBarrier) coordinate() {
-	for {
-		batch := make([]NodeArrival, 0, b.total)
+func (b *Barrier) Wait() {
+	b.mu.Lock()
 
-		for i := 0; i < b.total; i++ {
-			batch = append(batch, <-b.arrivals)
-		}
+	generation := b.generation
+	b.arrived++
 
-		for i := 0; i < len(batch); i++ {
-			for j := i + 1; j < len(batch); j++ {
-				if batch[j].Load < batch[i].Load {
-					batch[i], batch[j] = batch[j], batch[i]
-				}
-			}
-		}
-
-		for _, node := range batch {
-			close(node.Release)
+	if b.arrived == b.total {
+		b.arrived = 0
+		b.generation++
+		b.cond.Broadcast()
+	} else {
+		for generation == b.generation {
+			b.cond.Wait()
 		}
 	}
+
+	b.mu.Unlock()
 }
 
-func (b *ResourceAwareBarrier) Wait(nodeID int, load float64) {
-	release := make(chan struct{})
+func runCluster(nodes int) float64 {
+	barrier := NewBarrier(nodes)
 
-	b.arrivals <- NodeArrival{
-		NodeID:  nodeID,
-		Load:    load,
-		Release: release,
+	var wg sync.WaitGroup
+	var totalDelay time.Duration
+	var mu sync.Mutex
+
+	for i := 0; i < nodes; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for j := 0; j < iterations; j++ {
+				start := time.Now()
+				barrier.Wait()
+				delay := time.Since(start)
+
+				mu.Lock()
+				totalDelay += delay
+				mu.Unlock()
+			}
+		}()
 	}
 
-	<-release
+	wg.Wait()
+
+	return float64(totalDelay.Nanoseconds()) /
+		float64(nodes*iterations) / 1e6
 }
 
 func main() {
 	clusterSizes := []int{3, 5, 7, 9, 11}
 
-	fmt.Println("Cluster Size,Intelligent Delay (ms)")
+	fmt.Println("Cluster Size,Conventional Delay (ms)")
 
 	for _, nodes := range clusterSizes {
-		barrier := NewResourceAwareBarrier(nodes)
-
-		var wg sync.WaitGroup
-		var totalDelay time.Duration
-		var mu sync.Mutex
-
-		for i := 0; i < nodes; i++ {
-			wg.Add(1)
-
-			go func(nodeID int) {
-				defer wg.Done()
-
-				for j := 0; j < iterations; j++ {
-					load := float64((nodeID*17+j*13)%100) / 100.0
-
-					start := time.Now()
-					barrier.Wait(nodeID, load)
-					delay := time.Since(start)
-
-					mu.Lock()
-					totalDelay += delay
-					mu.Unlock()
-				}
-			}(i)
-		}
-
-		wg.Wait()
-
-		average := float64(totalDelay.Microseconds()) /
-			float64(nodes*iterations) / 1000
-
-		fmt.Printf("%d,%.6f\n", nodes, average)
+		delay := runCluster(nodes)
+		fmt.Printf("%d,%.6f\n", nodes, delay)
 	}
 }
